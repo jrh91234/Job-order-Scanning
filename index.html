@@ -207,19 +207,21 @@
                 const workbook = XLSX.read(data, { type: 'array' });
                 const firstSheetName = workbook.SheetNames[0];
                 const worksheet = workbook.Sheets[firstSheetName];
-                
-                // ✅ ใช้ raw: false เพื่อให้ได้ Text (String)
-                // ✅ ใช้ dateNF: 'dd/mm/yyyy' เพื่อบังคับให้ Date Value กลายเป็นรูปแบบวัน/เดือน/ปี
-                const jsonData = XLSX.utils.sheet_to_json(worksheet, { 
-                    header: 1, 
-                    raw: false, 
-                    dateNF: 'dd/mm/yyyy' 
-                });
-                
-                // วนลูปทุก Cell แล้วใช้กฎ "อ่านจากซ้าย"
-                const textArray = jsonData.map(row => row.map(cell => forceThaiDateParser(cell)).join(" "));
-                const textOutput = textArray.join("\n");
-                
+
+                let textOutput;
+                const smartParsed = tryParseProductionOrder(worksheet);
+                if (smartParsed) {
+                    textOutput = buildStructuredText(smartParsed);
+                } else {
+                    const jsonData = XLSX.utils.sheet_to_json(worksheet, {
+                        header: 1,
+                        raw: false,
+                        dateNF: 'dd/mm/yyyy'
+                    });
+                    const textArray = jsonData.map(row => row.map(cell => forceThaiDateParser(cell)).join(" "));
+                    textOutput = textArray.join("\n");
+                }
+
                 const base64 = btoa(unescape(encodeURIComponent(textOutput)));
                 sendToBackend(item, base64, 'text/plain', resolve);
              };
@@ -269,6 +271,75 @@
              return `${String(d).padStart(2,'0')}/${String(m).padStart(2,'0')}/${y}`;
          }
          return cellValue;
+      }
+
+      // ⭐ ตรวจสอบว่าไฟล์ Excel นี้เป็น "ใบสั่งผลิต" (生产订单) หรือไม่
+      // ถ้าใช่ → อ่านค่าจากเซลล์โดยตรง แล้วส่งเป็น text ที่ backend parse ได้ถูกต้อง
+      function tryParseProductionOrder(worksheet) {
+          const jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1, raw: false });
+          const allText = jsonData.map(r => r.join(' ')).join('\n');
+          if (!allText.includes('单据编号') && !allText.includes('生产订单')) return null;
+
+          let jobOrder = '', issueDate = '', finishDate = '', model = '', qty = '';
+
+          for (let r = 0; r < jsonData.length; r++) {
+              const row = jsonData[r];
+
+              for (let c = 0; c < row.length; c++) {
+                  const cell = String(row[c] || '').trim();
+                  const jobMatch = cell.match(/TH-SCDD\d+/);
+                  if (jobMatch && !jobOrder) jobOrder = jobMatch[0];
+
+                  if ((cell === '日期:' || cell === '日期') && !issueDate) {
+                      for (let cc = c + 1; cc < row.length; cc++) {
+                          const v = String(row[cc] || '').trim();
+                          if (v) { issueDate = convertToEUDate(v); break; }
+                      }
+                  }
+              }
+
+              const rowStr = row.join('|');
+              if (rowStr.includes('规格型号') && rowStr.includes('数量') && rowStr.includes('计划完工时间')) {
+                  let modelCol = -1, qtyCol = -1, finishCol = -1;
+                  row.forEach((cell, c) => {
+                      const v = String(cell || '').trim();
+                      if (v.includes('规格型号')) modelCol = c;
+                      if (v === '数量' || (v.includes('数量') && !v.includes('计划'))) qtyCol = c;
+                      if (v.includes('计划完工时间')) finishCol = c;
+                  });
+                  for (let dr = r + 1; dr < jsonData.length; dr++) {
+                      const dataRow = jsonData[dr];
+                      if (!dataRow || !dataRow.some(c => String(c || '').trim())) break;
+                      if (modelCol >= 0 && dataRow[modelCol]) model = String(dataRow[modelCol]).trim();
+                      if (qtyCol >= 0 && dataRow[qtyCol]) qty = String(dataRow[qtyCol]).trim().replace(/\.0+$/, '');
+                      if (finishCol >= 0 && dataRow[finishCol]) finishDate = convertToEUDate(String(dataRow[finishCol]).trim().split(' ')[0]);
+                      break;
+                  }
+                  break;
+              }
+          }
+
+          if (!jobOrder && !model) return null;
+          return { jobOrder, issueDate, finishDate, model, qty };
+      }
+
+      // แปลง yyyy/m/d → dd/mm/yyyy
+      function convertToEUDate(dateStr) {
+          if (!dateStr) return '';
+          const m = dateStr.match(/^(\d{4})[\/\-\.](\d{1,2})[\/\-\.](\d{1,2})/);
+          if (m) return `${String(parseInt(m[3])).padStart(2,'0')}/${String(parseInt(m[2])).padStart(2,'0')}/${m[1]}`;
+          return dateStr;
+      }
+
+      // สร้าง structured text ที่ backend parse ได้แม่นยำ
+      function buildStructuredText(p) {
+          const lines = [];
+          if (p.jobOrder) lines.push(p.jobOrder);
+          if (p.issueDate) lines.push(`DATE: ${p.issueDate}`);
+          if (p.finishDate) lines.push(`FINISH: ${p.finishDate}`);
+          if (p.model) lines.push(`MODEL: ${p.model}`);
+          if (p.qty) lines.push(`Qty ${p.qty}`);
+          return lines.join('\n');
       }
 
       function sendToBackend(item, base64, mimeType, resolve) {
