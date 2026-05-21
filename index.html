@@ -201,7 +201,8 @@
           const reader = new FileReader();
           
           // ⭐ 1. Excel Handling
-          if (item.file.type.includes('spreadsheet') || item.file.name.endsWith('.xlsx') || item.file.name.endsWith('.xls')) {
+          const lowerName = item.file.name.toLowerCase();
+          if (item.file.type.includes('spreadsheet') || lowerName.endsWith('.xlsx') || lowerName.endsWith('.xls')) {
              reader.onload = function(e) {
                 const data = new Uint8Array(e.target.result);
                 const workbook = XLSX.read(data, { type: 'array' });
