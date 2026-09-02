@@ -6,6 +6,7 @@
     <title>Drive Scanner V.24 (Force Left-to-Right Date)</title>
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600&display=swap" rel="stylesheet">
     
@@ -90,7 +91,7 @@
             <div class="h3 mb-1">📂</div>
             <span class="small fw-bold">เลือกไฟล์</span>
           </button>
-          <input type="file" id="uploadInput" accept="image/*, .xlsx, .xls" multiple class="d-none" onchange="addFilesToQueue(this)">
+          <input type="file" id="uploadInput" accept="image/*, .xlsx, .xls, .pdf, application/pdf" multiple class="d-none" onchange="addFilesToQueue(this)">
         </div>
       </div>
 
@@ -130,6 +131,202 @@
       let isRevealMode = false;    
       let previewModalInstance = null;
 
+      // ==========================================
+      // 📄 ส่วนรองรับไฟล์ PDF
+      // ==========================================
+      if (window.pdfjsLib) {
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+      }
+
+      function isPdfFile(file) {
+        return file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
+      }
+
+      function isExcelFile(file) {
+        const lowerName = file.name.toLowerCase();
+        return file.type.includes('spreadsheet') || lowerName.endsWith('.xlsx') || lowerName.endsWith('.xls');
+      }
+
+      function readFileAsArrayBuffer(file) {
+        return new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = e => resolve(e.target.result);
+          reader.onerror = () => reject(new Error('อ่านไฟล์ไม่สำเร็จ'));
+          reader.readAsArrayBuffer(file);
+        });
+      }
+
+      async function loadPdfDocument(file) {
+        if (!window.pdfjsLib) throw new Error('โหลดไลบรารี PDF ไม่สำเร็จ');
+        const buffer = await readFileAsArrayBuffer(file);
+        return await pdfjsLib.getDocument({ data: new Uint8Array(buffer) }).promise;
+      }
+
+      // รวม text item ที่อยู่คอลัมน์เดียวกันและติดกันแนวตั้ง ให้เป็น "เซลล์" เดียว
+      // (PDF ใบสั่งผลิตตัดคำขึ้นบรรทัดใหม่ในเซลล์เดียว เช่น "MO-20260831-" + "000121")
+      function mergePdfItemsIntoCells(items) {
+        const X_TOLERANCE = 3;
+        const Y_GAP = 12;
+        const columns = [];
+        items.forEach(item => {
+          let col = columns.find(c => Math.abs(c.x - item.x) <= X_TOLERANCE);
+          if (!col) { col = { x: item.x, items: [] }; columns.push(col); }
+          col.items.push(item);
+        });
+
+        const cells = [];
+        columns.forEach(col => {
+          col.items.sort((a, b) => a.top - b.top);
+          let current = null;
+          col.items.forEach(item => {
+            if (current && (item.top - current.lastTop) <= Y_GAP) {
+              const glue = /[-\/]$/.test(current.text) ? '' : ' ';
+              current.text += glue + item.text;
+              current.lastTop = item.top;
+            } else {
+              current = { x: col.x, top: item.top, lastTop: item.top, text: item.text };
+              cells.push(current);
+            }
+          });
+        });
+        cells.forEach(c => { c.key = c.text.replace(/\s/g, ''); });
+        return cells.sort((a, b) => a.top - b.top || a.x - b.x);
+      }
+
+      async function extractPdfPages(pdfDoc) {
+        const pages = [];
+        for (let n = 1; n <= pdfDoc.numPages; n++) {
+          const page = await pdfDoc.getPage(n);
+          const viewport = page.getViewport({ scale: 1 });
+          const content = await page.getTextContent();
+          const items = content.items
+            .map(it => ({
+              text: String(it.str || '').trim(),
+              x: it.transform[4],
+              top: viewport.height - it.transform[5]
+            }))
+            .filter(it => it.text);
+          pages.push(mergePdfItemsIntoCells(items));
+        }
+        return pages;
+      }
+
+      // แปลงเซลล์กลับเป็นข้อความรายบรรทัด (ใช้เป็นทางสำรองให้ backend หา pattern เอง)
+      function pdfCellsToText(cells) {
+        const ROW_TOLERANCE = 6;
+        const rows = [];
+        cells.forEach(cell => {
+          let row = rows.find(r => Math.abs(r.top - cell.top) <= ROW_TOLERANCE);
+          if (!row) { row = { top: cell.top, cells: [] }; rows.push(row); }
+          row.cells.push(cell);
+        });
+        rows.sort((a, b) => a.top - b.top);
+        return rows
+          .map(r => r.cells.sort((a, b) => a.x - b.x).map(c => c.text).join(' '))
+          .join('\n');
+      }
+
+      // เตรียมข้อความจาก PDF ให้ backend อ่านได้: วันที่ yyyy-mm-dd → dd/mm/yyyy,
+      // ตัดเวลา (10:49:07) ทิ้งกันสับสนกับจำนวน และตัดทศนิยมศูนย์ (128.000 → 128)
+      function normalizePdfText(text) {
+        return text
+          .replace(/\b\d{4}[\/\-\.]\d{1,2}[\/\-\.]\d{1,2}\b/g, m => convertToEUDate(m))
+          .replace(/\b\d{1,2}:\d{2}(:\d{2})?\b/g, ' ')
+          .replace(/\b\d{1,2}:(?!\d)/g, ' ')
+          .replace(/\b(\d+)\.0+\b/g, '$1');
+      }
+
+      // อ่านใบสั่งผลิต (生产工单 / 生产订单) จากตำแหน่งคอลัมน์ในตาราง
+      function tryParsePdfWorkOrder(cells) {
+        const allKeys = cells.map(c => c.key).join('\n');
+        if (!/生产工单|工单编号|生产订单|单据编号/.test(allKeys)) return null;
+
+        const headerAnchor = cells.find(c => c.key.includes('规格型号'));
+        if (!headerAnchor) return null;
+
+        const headerCells = cells.filter(c => Math.abs(c.top - headerAnchor.top) <= 12);
+        const headerOf = kw => headerCells.find(c => c.key.includes(kw));
+        const valueUnder = (kw) => {
+          const header = headerOf(kw);
+          if (!header) return '';
+          const below = cells
+            .filter(c => Math.abs(c.x - header.x) <= 6 && c.top > headerAnchor.top + 5 && c.top < headerAnchor.top + 80)
+            .sort((a, b) => a.top - b.top);
+          return below.length ? below[0].text.trim() : '';
+        };
+
+        let jobOrder = '';
+        for (const cell of cells) {
+          const match = cell.key.match(/TH-SCDD\d+/) || cell.key.match(/MO-?\d{8}-?\d{3,8}/);
+          if (match) { jobOrder = match[0]; break; }
+        }
+
+        const model = valueUnder('规格型号');
+        const qtyRaw = valueUnder('数量');
+        const startRaw = valueUnder('计划开工时间');
+        const finishRaw = valueUnder('计划完工时间');
+
+        let qty = '';
+        if (qtyRaw) {
+          const num = parseFloat(qtyRaw.replace(/,/g, ''));
+          if (!isNaN(num)) qty = String(num);
+        }
+
+        const issueDate = startRaw ? convertToEUDate(startRaw.split(' ')[0]) : '';
+        const finishDate = finishRaw ? convertToEUDate(finishRaw.split(' ')[0]) : '';
+
+        if (!jobOrder && !model) return null;
+        return { jobOrder, issueDate, finishDate, model, qty };
+      }
+
+      async function renderPdfPageToCanvas(pdfDoc, pageNumber, maxDimension) {
+        const page = await pdfDoc.getPage(pageNumber);
+        const base = page.getViewport({ scale: 1 });
+        let scale = maxDimension / Math.max(base.width, base.height);
+        if (!isFinite(scale) || scale <= 0) scale = 1;
+        const viewport = page.getViewport({ scale });
+        const canvas = document.createElement('canvas');
+        canvas.width = viewport.width;
+        canvas.height = viewport.height;
+        await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+        return canvas;
+      }
+
+      // PDF ที่มีข้อความ → ส่ง text ให้ backend, PDF ที่เป็นภาพสแกน → ส่งรูปให้ OCR
+      async function processPdfItem(item, resolve) {
+        try {
+          const pdfDoc = await loadPdfDocument(item.file);
+          const pages = await extractPdfPages(pdfDoc);
+
+          let parsed = null;
+          for (const cells of pages) {
+            parsed = tryParsePdfWorkOrder(cells);
+            if (parsed) break;
+          }
+
+          if (parsed) {
+            const base64 = btoa(unescape(encodeURIComponent(buildStructuredText(parsed))));
+            sendToBackend(item, base64, 'text/plain', resolve);
+            return;
+          }
+
+          const plainText = pages.map(pdfCellsToText).join('\n').trim();
+          if (plainText.replace(/\s/g, '').length >= 20) {
+            const base64 = btoa(unescape(encodeURIComponent(normalizePdfText(plainText))));
+            sendToBackend(item, base64, 'text/plain', resolve);
+            return;
+          }
+
+          // ไม่มีข้อความในไฟล์ (สแกนเป็นรูป) → เรนเดอร์หน้าแรกส่งเข้า OCR
+          const canvas = await renderPdfPageToCanvas(pdfDoc, 1, 1600);
+          const base64 = canvas.toDataURL('image/jpeg', 0.8).split(',')[1];
+          sendToBackend(item, base64, 'image/jpeg', resolve);
+        } catch (err) {
+          handleError(item, 'PDF Error: ' + (err && err.message ? err.message : err), resolve);
+        }
+      }
+
+
       function addFilesToQueue(inputElement) {
         if (!inputElement.files.length) return;
         document.getElementById('emptyMsg').style.display = 'none';
@@ -160,6 +357,18 @@
             const reader = new FileReader();
             reader.onload = e => { imgEl.src = e.target.result; imgEl.classList.remove('d-none'); };
             reader.readAsDataURL(item.file);
+        } else if (isPdfFile(item.file)) {
+            tableEl.classList.remove('d-none');
+            loadPdfDocument(item.file)
+              .then(pdfDoc => renderPdfPageToCanvas(pdfDoc, 1, 1400))
+              .then(canvas => {
+                  imgEl.src = canvas.toDataURL('image/jpeg', 0.9);
+                  imgEl.classList.remove('d-none');
+                  tableEl.classList.add('d-none');
+              })
+              .catch(err => {
+                  tableEl.innerHTML = `<div class="text-danger text-center p-4">❌ ไม่สามารถอ่านไฟล์ PDF นี้ได้<br><small>${err}</small></div>`;
+              });
         } else {
             tableEl.classList.remove('d-none');
             const reader = new FileReader();
@@ -198,11 +407,13 @@
       function processSingleItem(item) {
         return new Promise((resolve) => {
           if (!queue.find(q => q.id === item.id)) { resolve(); return; }
+          // ⭐ 0. PDF Handling
+          if (isPdfFile(item.file)) { processPdfItem(item, resolve); return; }
+
           const reader = new FileReader();
-          
+
           // ⭐ 1. Excel Handling
-          const lowerName = item.file.name.toLowerCase();
-          if (item.file.type.includes('spreadsheet') || lowerName.endsWith('.xlsx') || lowerName.endsWith('.xls')) {
+          if (isExcelFile(item.file)) {
              reader.onload = function(e) {
                 const data = new Uint8Array(e.target.result);
                 const workbook = XLSX.read(data, { type: 'array' });
@@ -512,6 +723,8 @@
              const reader = new FileReader();
              reader.onload = e => document.getElementById(`img-${item.id}`).src = e.target.result;
              reader.readAsDataURL(item.file);
+        } else if (isPdfFile(item.file)) {
+             thumbContent = `<div class="thumb-img mt-1" style="color:#ef4444;">📄</div>`;
         } else {
              thumbContent = `<div class="thumb-img mt-1" style="color:#10b981;">📊</div>`;
         }

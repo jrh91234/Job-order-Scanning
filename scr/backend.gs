@@ -24,7 +24,7 @@ function processFileWithDrive(base64Data, mimeType) {
        const decoded = Utilities.base64Decode(base64Data);
        text = Utilities.newBlob(decoded).getDataAsString();
     } 
-    // 📸 รับรูปภาพ (OCR)
+    // 📸 รับรูปภาพ / PDF (OCR ผ่าน Drive)
     else {
       const blob = Utilities.newBlob(Utilities.base64Decode(base64Data), mimeType, 'temp_file');
       const resource = { title: blob.getName(), mimeType: blob.getContentType() };
@@ -46,8 +46,8 @@ function processFileWithDrive(base64Data, mimeType) {
       rawText: text 
     };
 
-    // 1. Job Order
-    const jobMatch = text.match(/TH-SCDD\d+/);
+    // 1. Job Order (รองรับทั้ง TH-SCDD... และ MO-yyyymmdd-xxxxxx จากใบสั่งผลิต PDF)
+    const jobMatch = text.match(/TH-SCDD\d+/) || text.match(/MO-?\d{8}-?\d{3,8}/);
     if (jobMatch) {
       data.jobOrder = jobMatch[0];
       data.scores.job = 100;
@@ -65,7 +65,7 @@ function processFileWithDrive(base64Data, mimeType) {
     const allNumbers = [...text.matchAll(/\b\d{1,5}\b/g)]; 
     let bestCandidate = null;
     let maxScore = -9999;
-    const keywords = ["计划数量", "จำนวน", "จํานวน", "Qty", "Quantity", "Planned", "วางแผน"]; 
+    const keywords = ["计划数量", "数量", "จำนวน", "จํานวน", "Qty", "Quantity", "Planned", "วางแผน"]; 
     
     allNumbers.forEach(match => {
        const numStr = match[0];
@@ -116,6 +116,8 @@ function processFileWithDrive(base64Data, mimeType) {
            (c.startsWith('R9') || c.startsWith('SD') || c.startsWith('QO') || c.startsWith('Q0') || c.startsWith('S9') || c.includes('-')) && 
            !c.startsWith('TH-') &&  // ⭐ กฎใหม่: ห้ามขึ้นต้นด้วย TH-
            !c.startsWith('JRTL') && // ⭐ กฎใหม่: ห้ามขึ้นต้นด้วย JRTL
+           !/^MO-?\d{8}/.test(c) && // ⭐ กฎใหม่: ห้ามเป็นเลขใบสั่งผลิต MO-yyyymmdd-xxxxxx
+           (!data.jobOrder || !data.jobOrder.includes(c)) && // ห้ามเป็นส่วนหนึ่งของเลข JOB
            !c.includes('WAYS') && !c.includes('LOAD') && !c.includes('CENTER') &&
            c.length > 5
          ) || "";
@@ -179,7 +181,7 @@ function findExactModelInText(fullText) {
         descriptionWords.forEach(word => { if (dbModelRaw.includes(word)) score -= 100; });
         
         // ⭐ Penalty (Ban Words) - หักคะแนนหนักถ้าเป็นคำต้องห้าม
-        if (dbModelRaw.startsWith('JRTL') || dbModelRaw.startsWith('TH-')) {
+        if (dbModelRaw.startsWith('JRTL') || dbModelRaw.startsWith('TH-') || /^MO-?\d{8}/.test(dbModelRaw)) {
             score = -5000; 
         }
 
@@ -196,7 +198,7 @@ function findExactModelInText(fullText) {
 
 function findClosestModelInDB(candidate) {
   // ⭐ เช็คตั้งแต่ปากประตู: ถ้าคำที่ส่งมาเป็นคำต้องห้าม ให้ดีดออกทันที
-  if (candidate.startsWith('JRTL') || candidate.startsWith('TH-')) return { found: false };
+  if (candidate.startsWith('JRTL') || candidate.startsWith('TH-') || /^MO-?\d{8}/.test(candidate)) return { found: false };
 
   try {
     const ss = SpreadsheetApp.openById(SHEET_ID);
